@@ -48,9 +48,10 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier, StackingClassifier
 from sklearn.linear_model import LogisticRegression
 from xgboost import XGBClassifier
+from sklearn.model_selection import cross_val_score
 
 # Imbalance
-from imblearn.over_sampling import SMOTE
+from imblearn.over_sampling import BorderlineSMOTE
 
 # Visualization
 import matplotlib.pyplot as plt
@@ -58,19 +59,20 @@ import matplotlib.gridspec as gridspec
 import seaborn as sns
 
 # Monkey-patch plt.savefig to fall back to an output directory if the current directory is blocked.
-plt_save_orig = plt.savefig
+if not hasattr(plt, '_savefig_orig'):
+    plt._savefig_orig = plt.savefig
 
-def safe_save_fig(fname, **kwargs):
-    target = BASE_DIR / fname
-    try:
-        return plt_save_orig(target, **kwargs)
-    except PermissionError:
-        fallback = OUTPUT_DIR / fname
-        fallback.parent.mkdir(parents=True, exist_ok=True)
-        print(f"    PermissionError saving figure {fname}; writing to {fallback}")
-        return plt_save_orig(fallback, **kwargs)
+    def safe_save_fig(fname, **kwargs):
+        target = BASE_DIR / fname
+        try:
+            return plt._savefig_orig(target, **kwargs)
+        except PermissionError:
+            fallback = OUTPUT_DIR / fname
+            fallback.parent.mkdir(parents=True, exist_ok=True)
+            print(f"    PermissionError saving figure {fname}; writing to {fallback}")
+            return plt._savefig_orig(fallback, **kwargs)
 
-plt.savefig = safe_save_fig
+    plt.savefig = safe_save_fig
 
 # SHAP (optional)
 try:
@@ -144,7 +146,7 @@ EXPERIMENT_CONFIGS = {
 # ============================================================
 
 def evaluate_model(model, X_test, y_test, threshold=0.3):
-    y_pred = model.predict(X_test)
+    # y_pred = model.predict(X_test)
     y_prob = model.predict_proba(X_test)[:, 1]
     y_pred = (y_prob >= threshold).astype(int)
     metrics = {
@@ -173,6 +175,21 @@ def print_section(title):
 
 def get_pos_weight(y_train):
     return (y_train == 0).sum() / max((y_train == 1).sum(), 1)
+
+
+def cv_stability_compare(models_dict, X, y, cv=5, scoring='recall'):
+    """返回每个模型的CV均值和标准差"""
+    results = {}
+    kfold = StratifiedKFold(n_splits=cv, shuffle=True, random_state=42)
+    for name, model in models_dict.items():
+        scores = cross_val_score(model, X, y, cv=kfold, scoring=scoring, n_jobs=-1)
+        results[name] = {
+            'mean': round(scores.mean(), 4),
+            'std':  round(scores.std(), 4),
+            'cv_scores': scores
+        }
+        print(f"  {name}: {scoring} = {scores.mean():.4f} ± {scores.std():.4f}")
+    return results
 
 
 # ============================================================
@@ -263,7 +280,7 @@ for exp_name, feature_list in EXPERIMENT_CONFIGS.items():
     X_train_s = scaler.fit_transform(X_train)
     X_test_s  = scaler.transform(X_test)
 
-    smote = SMOTE(random_state=42)
+    smote = BorderlineSMOTE(random_state=42)
     X_tr_bal, y_tr_bal = smote.fit_resample(X_train_s, y_train)
 
     pw = get_pos_weight(y_train)
@@ -338,7 +355,13 @@ for exp_name, feature_list in EXPERIMENT_CONFIGS.items():
     X_te3_s   = scaler3.transform(X_test3)
 
     # Do not apply SMOTEENN in Phase 3 to preserve the hybrid model evaluation behavior
-    X_tr3_bal, y_tr3_bal = X_tr3_s, y_train3
+    # X_tr3_bal, y_tr3_bal = X_tr3_s, y_train3
+    # only for ExpA to use SMOTE, ExpB already has strong predictive features that may not benefit from synthetic oversampling (and to avoid potential leakage issues)
+    if exp_name == "ExpA_EarlyOnly":
+        smote3 = BorderlineSMOTE(random_state=42)
+        X_tr3_bal, y_tr3_bal = smote3.fit_resample(X_tr3_s, y_train3)
+    else:
+        X_tr3_bal, y_tr3_bal = X_tr3_s, y_train3
 
     pw3 = get_pos_weight(y_train3)
 
@@ -347,7 +370,16 @@ for exp_name, feature_list in EXPERIMENT_CONFIGS.items():
     def make_knn():
         return KNeighborsClassifier()
     def make_rf():
-        return RandomForestClassifier(class_weight='balanced', random_state=42)
+        if exp_name == "ExpA_EarlyOnly":
+            return RandomForestClassifier(
+                    class_weight={0: 1, 1: 4},
+                    random_state=42
+            )
+        else:
+            return RandomForestClassifier(
+                    class_weight='balanced',
+                    random_state=42
+            )
     def make_xgb():
         return XGBClassifier(scale_pos_weight=pw3, eval_metric='logloss', random_state=42)
 
@@ -372,14 +404,16 @@ for exp_name, feature_list in EXPERIMENT_CONFIGS.items():
                            ),
         "Hybrid_RF+XGB":   VotingClassifier(
                                estimators=[('rf', make_rf()), ('xgb', make_xgb())],
-                               voting='soft'
+                               voting='soft',
+                               weights=[2, 3]
                            ),
         "Hybrid_ALL4":     VotingClassifier(
                                estimators=[
                                    ('svc', make_svc()), ('knn', make_knn()),
                                    ('rf',  make_rf()),  ('xgb', make_xgb()),
                                ],
-                               voting='soft'
+                               voting='soft',
+                               weights=[1, 1, 2, 3]
                            ),
         "Stacking_ALL4":  StackingClassifier(
                                estimators=[
@@ -400,7 +434,13 @@ for exp_name, feature_list in EXPERIMENT_CONFIGS.items():
         t0 = time.time()
         model.fit(X_tr3_bal, y_tr3_bal)
         train_time = round(time.time() - t0, 2)
-        metrics, _, y_prob = evaluate_model(model, X_te3_s, y_test3)
+
+        # metrics, _, y_prob = evaluate_model(model, X_te3_s, y_test3)
+        if exp_name == "ExpA_EarlyOnly":
+            metrics, _, y_prob = evaluate_model(model, X_te3_s, y_test3, threshold=0.2)
+        else:
+            metrics, _, y_prob = evaluate_model(model, X_te3_s, y_test3)
+
         metrics["Train_Time(s)"] = train_time
         p3_res[name] = metrics
         fpr, tpr, _ = roc_curve(y_test3, y_prob)
@@ -410,6 +450,15 @@ for exp_name, feature_list in EXPERIMENT_CONFIGS.items():
 
     all_results[exp_name]["Phase3_Hybrid"]  = pd.DataFrame(p3_res).T
     all_roc_data[exp_name]["Phase3_Hybrid"] = p3_roc
+
+    # 在 Phase 4 之前，先跑一下各单模型的Recall
+    recall_scores = {}
+    for name, model_name in [('svc', 'SVC'), ('knn', 'KNN'), ('rf', 'RandomForest'), ('xgb', 'XGBoost')]:
+        est = phase3_models[model_name]
+        prob = est.predict_proba(X_te3_s)[:, 1]
+        pred = (prob >= 0.2).astype(int)  # 用低阈值评估Recall
+        recall_scores[name] = recall_score(y_test3, pred, zero_division=0)
+
 
     # ----------------------------------------------------------
     # PHASE 4: Hyperparameter Tuning → Optimized Hybrid Models
@@ -457,6 +506,27 @@ for exp_name, feature_list in EXPERIMENT_CONFIGS.items():
     xgb_rs.fit(X_tr3_bal, y_tr3_bal)
     print(f"    XGB best: {xgb_rs.best_params_}  CV-AUC={round(xgb_rs.best_score_, 4)}")
 
+    # Phase 4 之前，先计算各模型在低阈值下的 Recall
+    def get_recall_at_threshold(model, X_test, y_test, threshold=0.25):
+        prob = model.predict_proba(X_test)[:, 1]
+        pred = (prob >= threshold).astype(int)
+        return recall_score(y_test, pred, zero_division=0)
+
+    recall_svc = get_recall_at_threshold(svc_gs.best_estimator_, X_te3_s, y_test3)
+    recall_knn = get_recall_at_threshold(knn_rs.best_estimator_, X_te3_s, y_test3)
+    recall_rf  = get_recall_at_threshold(rf_gs.best_estimator_,  X_te3_s, y_test3)
+    recall_xgb = get_recall_at_threshold(xgb_rs.best_estimator_, X_te3_s, y_test3)
+
+    # 然后用 recall 分配权重（ExpA专用）
+    if exp_name == "ExpA_EarlyOnly":
+        w_svc, w_knn, w_rf, w_xgb = recall_svc, recall_knn, recall_rf, recall_xgb
+    else:
+        # ExpB 保持 AUC 权重
+        w_svc = svc_gs.best_score_
+        w_knn = knn_rs.best_score_
+        w_rf  = rf_gs.best_score_
+        w_xgb = xgb_rs.best_score_
+
     # Build tuned hybrid models (weighted soft-voting)
     tuned_models = {
         # Tuned individuals (for ablation reference)
@@ -494,10 +564,10 @@ for exp_name, feature_list in EXPERIMENT_CONFIGS.items():
             ],
             voting='soft',
             weights=[
-                round(svc_gs.best_score_, 3),
-                round(knn_rs.best_score_, 3),
-                round(rf_gs.best_score_,  3),
-                round(xgb_rs.best_score_, 3),
+                recall_scores['svc'],
+                recall_scores['knn'],
+                recall_scores['rf'],
+                recall_scores['xgb'],
             ]
         ),
         "Tuned_Stacking_ALL4":  StackingClassifier(
@@ -840,6 +910,16 @@ plt.tight_layout()
 plt.savefig("viz8_phase4_full_both_experiments.png", dpi=150)
 plt.close()
 print("  Saved: viz8_phase4_full_both_experiments.png")
+
+compare_models = {
+    'Tuned_RF':            tuned_models['Tuned_RF'],
+    'Tuned_XGB':           tuned_models['Tuned_XGB'],
+    'Tuned_Hybrid_RF+XGB': tuned_models['Tuned_Hybrid_RF+XGB'],
+    'Tuned_Hybrid_ALL4':   tuned_models['Tuned_Hybrid_ALL4'],
+    'Tuned_Stacking_ALL4': tuned_models['Tuned_Stacking_ALL4'],
+}
+# ExpA用recall，ExpB也可以同时输出recall和roc_auc
+stability_results = cv_stability_compare(compare_models, X_sel[selected], y_full)
 
 
 # ============================================================
