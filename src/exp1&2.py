@@ -57,7 +57,8 @@ warnings.filterwarnings("ignore")   # Suppress sklearn/XGBoost deprecation noise
 # Resolve the working directory so the script can be run from
 # any location (Jupyter, IDE, or command line).
 BASE_DIR   = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
-OUTPUT_DIR = BASE_DIR / "pipeline_output"   # Fallback directory for permission-blocked writes
+INPUT_DIR = Path(r'D:\vscode\Code\FYP\data')
+OUTPUT_DIR = Path(r"D:\vscode\Code\FYP\outputs\exp1&2")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -77,7 +78,7 @@ def safe_save_csv(df, fname):
     -------
     pathlib.Path of the file actually written
     """
-    target = BASE_DIR / fname
+    target = OUTPUT_DIR / fname
     try:
         df.to_csv(target)
         return target
@@ -141,14 +142,17 @@ if not hasattr(plt, '_savefig_orig'):
 
     def safe_save_fig(fname, **kwargs):
         """
-        Drop-in replacement for plt.savefig that falls back to
-        OUTPUT_DIR if the primary path is not writable.
+        Drop-in replacement for plt.savefig that saves relative
+        filenames into OUTPUT_DIR and falls back there on error.
         """
-        target = BASE_DIR / fname
+        target = Path(fname)
+        if not target.is_absolute():
+            target = OUTPUT_DIR / target
+        target.parent.mkdir(parents=True, exist_ok=True)
         try:
             return plt._savefig_orig(target, **kwargs)
         except PermissionError:
-            fallback = OUTPUT_DIR / fname
+            fallback = OUTPUT_DIR / target.name
             fallback.parent.mkdir(parents=True, exist_ok=True)
             print(f"    PermissionError saving figure {fname}; writing to {fallback}")
             return plt._savefig_orig(fallback, **kwargs)
@@ -396,7 +400,7 @@ print_section("LOADING & PREPROCESSING DATA")
 # ── 4.1  Load Raw Dataset ────────────────────────────────────
 # Source: UCI Cervical Cancer (Risk Factors) Dataset
 # 858 rows × 36 features; missing values are encoded as '?'
-df_raw = pd.read_csv(BASE_DIR / "kag_risk_factors_cervical_cancer.csv")
+df_raw = pd.read_csv(INPUT_DIR / "kag_risk_factors_cervical_cancer.csv")
 df_raw = df_raw.replace("?", np.nan)   # Standardise missing-value representation
 
 # ── 4.2  Drop Uninformative Columns ─────────────────────────
@@ -547,8 +551,14 @@ def run_phase1_baseline(exp_name, X_full, y_full):
     # Synthesises minority samples only near the decision boundary,
     # producing more informative examples than vanilla SMOTE.
     # Applied exclusively to the training set.
-    smote              = BorderlineSMOTE(random_state=42)
-    X_tr_bal, y_tr_bal = smote.fit_resample(X_train_s, y_train)
+    # smote              = BorderlineSMOTE(random_state=42)
+    # X_tr_bal, y_tr_bal = smote.fit_resample(X_train_s, y_train)
+    # Add this condition like you did in Phase 3
+    if exp_name == "ExpA_EarlyOnly":
+        smote = BorderlineSMOTE(random_state=42)
+        X_tr_bal, y_tr_bal = smote.fit_resample(X_train_s, y_train)
+    else:
+        X_tr_bal, y_tr_bal = X_train_s, y_train
 
     # ── 1d. Define and train baseline models ──────────────────
     pw = get_pos_weight(y_train)   # XGBoost class-imbalance weight
@@ -929,7 +939,7 @@ def run_phase4_tuned_hybrids(
             'kernel': ['rbf', 'linear'],
             'gamma':  ['scale', 'auto'],
         },
-        cv=cv_strategy, scoring='roc_auc', n_jobs=-1
+        cv=cv_strategy, scoring='average_precision', n_jobs=-1
     )
     svc_gs.fit(X_tr3_bal, y_tr3_bal)
     print(f"    SVC best: {svc_gs.best_params_}  CV-AUC={round(svc_gs.best_score_, 4)}")
@@ -945,7 +955,7 @@ def run_phase4_tuned_hybrids(
             'weights':     ['uniform', 'distance'],
             'metric':      ['euclidean', 'manhattan'],
         },
-        n_iter=12, cv=cv_strategy, scoring='roc_auc',
+        n_iter=12, cv=cv_strategy, scoring='average_precision',
         random_state=42, n_jobs=-1
     )
     knn_rs.fit(X_tr3_bal, y_tr3_bal)
@@ -962,7 +972,7 @@ def run_phase4_tuned_hybrids(
             'max_depth':         [None, 10, 20],
             'min_samples_split': [2, 5],
         },
-        cv=cv_strategy, scoring='roc_auc', n_jobs=-1
+        cv=cv_strategy, scoring='average_precision', n_jobs=-1
     )
     rf_gs.fit(X_tr3_bal, y_tr3_bal)
     print(f"    RF  best: {rf_gs.best_params_}  CV-AUC={round(rf_gs.best_score_, 4)}")
@@ -980,7 +990,7 @@ def run_phase4_tuned_hybrids(
             'learning_rate': [0.01, 0.05, 0.1],
             'subsample':     [0.7, 0.8, 1.0],
         },
-        n_iter=15, cv=cv_strategy, scoring='roc_auc',
+        n_iter=15, cv=cv_strategy, scoring='average_precision',
         random_state=42, n_jobs=-1
     )
     xgb_rs.fit(X_tr3_bal, y_tr3_bal)
@@ -1079,7 +1089,9 @@ def run_phase4_tuned_hybrids(
         t0 = time.time()
         model.fit(X_tr3_bal, y_tr3_bal)
         train_time = round(time.time() - t0, 2)
-        metrics, _, y_prob = evaluate_model(model, X_te3_s, y_test3)
+        # metrics, _, y_prob = evaluate_model(model, X_te3_s, y_test3)
+        thresh = 0.2 if exp_name == "ExpA_EarlyOnly" else 0.3
+        metrics, _, y_prob = evaluate_model(model, X_te3_s, y_test3, threshold=thresh)
         metrics["Train_Time(s)"] = train_time
         res[name] = metrics
         fpr, tpr, _ = roc_curve(y_test3, y_prob)
@@ -1527,23 +1539,21 @@ print("  Saved: viz8_phase4_full_both_experiments.png")
 # ── Cross-Validation Stability Analysis ───────────────────────
 # Compares five key models across 5-fold stratified CV to assess
 # whether held-out performance is consistent or a lucky artefact.
-# Uses the ExpB tuned models and features, retrieved from the
-# shared stores populated by the orchestrator loop.
+# Uses the ExpB tuned models and features, retrieved from the shared stores populated by the orchestrator loop.
 # To compare ExpA instead, replace the exp key with "ExpA_EarlyOnly".
-_cv_exp      = "ExpB_WithScreening"
-_cv_selected = all_selected[_cv_exp]
-_cv_models   = all_tuned_models[_cv_exp]
-
-compare_models = {
-    'Tuned_RF':            _cv_models['Tuned_RF'],
-    'Tuned_XGB':           _cv_models['Tuned_XGB'],
-    'Tuned_Hybrid_RF+XGB': _cv_models['Tuned_Hybrid_RF+XGB'],
-    'Tuned_Hybrid_ALL4':   _cv_models['Tuned_Hybrid_ALL4'],
-    'Tuned_Stacking_ALL4': _cv_models['Tuned_Stacking_ALL4'],
-}
-stability_results = cv_stability_compare(
-    compare_models, df_raw[_cv_selected], df_raw[TARGET]
-)
+# Run for BOTH experiments
+for _cv_exp in EXPERIMENT_CONFIGS.keys():
+    _cv_selected = all_selected[_cv_exp]
+    _cv_models   = all_tuned_models[_cv_exp]
+    compare_models = {
+        'Tuned_RF':            _cv_models['Tuned_RF'],
+        'Tuned_XGB':           _cv_models['Tuned_XGB'],
+        'Tuned_Hybrid_RF+XGB': _cv_models['Tuned_Hybrid_RF+XGB'],
+        'Tuned_Hybrid_ALL4':   _cv_models['Tuned_Hybrid_ALL4'],
+        'Tuned_Stacking_ALL4': _cv_models['Tuned_Stacking_ALL4'],
+    }
+    print(f"\n  CV Stability — {_cv_exp}")
+    cv_stability_compare(compare_models, df_raw[_cv_selected], df_raw[TARGET])
 
 
 # ─────────────────────────────────────────────────────────────
